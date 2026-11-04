@@ -1,0 +1,23 @@
+[package]
+name = "leftover"
+publish = false
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "A BufRead adapter for data spanning buffer boundaries"
+
+[dependencies]
+memchr = "2.7"
+
+[dev-dependencies]
+bytes = "1.12"
+bytesreader = { git = "https://github.com/WangLabCSU/bytesreader", rev = "884d681a615aa0cc7d26fbe908b18968941c33f4" }
+
+[[bench]]
+name = "reader"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"
