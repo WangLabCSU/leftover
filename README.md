@@ -1,5 +1,10 @@
 # leftover
 
+[<img alt="github" src="https://img.shields.io/badge/github-WangLabCSU/leftover-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/WangLabCSU/leftover)
+[<img alt="crates.io" src="https://img.shields.io/crates/v/leftover.svg?style=for-the-badge&color=fc8d62&logo=rust" height="20">](https://crates.io/crates/leftover)
+[<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-leftover-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/leftover)
+[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/WangLabCSU/leftover/ci.yml?branch=main&style=for-the-badge" height="20">](https://github.com/WangLabCSU/leftover/actions?query=branch%3Amain)
+
 `leftover` provides a `BufRead` adapter for processing data, such as records,
 that spans buffer boundaries. It lets you save a partial record before reading
 the next chunk and then work with both parts together.
