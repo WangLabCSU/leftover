@@ -8,7 +8,8 @@
 //! current chunk does not contain enough data, call [`LeftoverView::accumulate`]
 //! to save it before filling the next view. Once you have enough, call
 //! [`LeftoverView::take_view`] to borrow the data or [`LeftoverView::take_owned`]
-//! to copy it into a vector. These view operations do not read from the source.
+//! to copy it into a vector. Use [`LeftoverView::consume`] to discard the same
+//! range without copying it. These view operations do not read from the source.
 //!
 //! Both `take` methods return the entire leftover followed by the first `end`
 //! bytes of the current chunk. For example, with leftover `ab` and current

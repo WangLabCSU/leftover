@@ -10,7 +10,8 @@ use std::io::{self, BufRead};
 /// saved from earlier chunks. If you need more data, call
 /// [`LeftoverView::accumulate`] before filling the next view. Once you have
 /// enough, [`LeftoverView::take_view`] borrows the data and
-/// [`LeftoverView::take_owned`] copies it into a vector.
+/// [`LeftoverView::take_owned`] copies it into a vector. Use
+/// [`LeftoverView::consume`] to discard the data without returning it.
 ///
 /// This adapter does not implement `Read` or `BufRead`.
 ///
@@ -149,6 +150,42 @@ impl<'a> LeftoverView<'a> {
         });
     }
 
+    /// Discard the leftover and the first `end` bytes of the current chunk.
+    ///
+    /// `end` counts only bytes from [`Self::buffer`]; use zero to discard just
+    /// the leftover. The discarded bytes are excluded from subsequent views.
+    /// This operation does not copy the data.
+    ///
+    /// # Panics
+    /// Panics if `end` exceeds the current chunk's length. In that case, the
+    /// leftover and current chunk remain available.
+    ///
+    /// ```
+    /// use std::io::BufReader;
+    ///
+    /// use leftover::LeftoverReader;
+    ///
+    /// let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
+    /// reader.fill_view()?.accumulate();
+    /// reader.fill_view()?.consume(2); // Discards "abcde".
+    /// let view = reader.fill_view()?;
+    /// assert!(view.leftover().is_empty());
+    /// assert_eq!(view.buffer(), b"f");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[inline]
+    pub fn consume(self, end: usize) {
+        assert!(
+            end <= self.buf.len(),
+            "end exceeds the current chunk's length"
+        );
+        self.leftover.clear();
+        *self.staged = Some(Action {
+            consume: end,
+            leftover: LeftoverAction::None,
+        });
+    }
+
     /// Take the leftover and the first `end` bytes of the current chunk as one
     /// borrowed slice.
     ///
@@ -270,7 +307,7 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     /// needed.
     ///
     /// The leftover and current chunk are borrowed separately, without joining
-    /// or copying them. Bytes already taken are excluded. At EOF, the current
+    /// or copying them. Bytes already taken or consumed are excluded. At EOF, the current
     /// chunk is empty, but the leftover can still contain data. A reader with
     /// a zero-capacity buffer can also return an empty chunk before EOF.
     ///
@@ -318,7 +355,7 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
 impl<R: ?Sized> LeftoverReader<R> {
     /// Return a reference to the wrapped reader.
     ///
-    /// Bytes taken or accumulated by the latest view may still appear in the
+    /// Bytes taken, consumed, or accumulated by the latest view may still appear in the
     /// wrapped reader until the next [`Self::fill_view`], [`Self::get_mut`],
     /// or [`Self::into_inner`] call.
     #[inline]
@@ -341,7 +378,7 @@ impl<R: ?Sized> LeftoverReader<R> {
 
     /// Unwrap the reader, discarding any leftover.
     ///
-    /// The returned reader continues after bytes already taken or accumulated.
+    /// The returned reader continues after bytes already taken, consumed, or accumulated.
     /// Bytes saved in the leftover are not put back into the returned reader.
     #[inline]
     pub fn into_inner(mut self) -> R
@@ -464,6 +501,49 @@ mod tests {
         assert_eq!(view.buffer(), b"def");
         assert_eq!(view.take_owned(1), b"d");
         assert_eq!(reader.fill_view().unwrap().buffer(), b"ef");
+    }
+
+    #[test]
+    fn consume_discards_leftover_and_selected_chunk_bytes() {
+        for end in 0..=3 {
+            let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
+            reader.fill_view().unwrap().accumulate();
+            let view = reader.fill_view().unwrap();
+            assert_eq!(view.leftover(), b"abc");
+            assert_eq!(view.buffer(), b"def");
+            view.consume(end);
+
+            let view = reader.fill_view().unwrap();
+            assert!(view.leftover().is_empty());
+            assert_eq!(view.buffer(), &b"def"[end..]);
+        }
+
+        let mut reader = LeftoverReader::new(b"abcdef".as_slice());
+        reader.fill_view().unwrap().consume(2);
+        assert_eq!(reader.fill_view().unwrap().buffer(), b"cdef");
+        reader.fill_view().unwrap().consume(1);
+        assert_eq!(reader.into_inner(), b"def".as_slice());
+    }
+
+    #[test]
+    fn consume_at_eof_and_out_of_bounds() {
+        let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
+        reader.fill_view().unwrap().accumulate();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reader.fill_view().unwrap().consume(4);
+        }));
+        assert!(result.is_err());
+        let view = reader.fill_view().unwrap();
+        assert_eq!(view.leftover(), b"abc");
+        assert_eq!(view.buffer(), b"def");
+        view.accumulate();
+        let view = reader.fill_view().unwrap();
+        assert_eq!(view.leftover(), b"abcdef");
+        assert!(view.buffer().is_empty());
+        view.consume(0);
+        let view = reader.fill_view().unwrap();
+        assert!(view.leftover().is_empty());
+        assert!(view.buffer().is_empty());
     }
 
     #[test]

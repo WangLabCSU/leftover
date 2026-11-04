@@ -34,5 +34,8 @@ Use `take_owned()` to copy the result into a new vector that can outlive the
 next read. Its `end` argument, like `take_view()`'s, counts bytes in the current
 chunk only.
 
+Use `consume(end)` to discard the leftover and the first `end` bytes of the
+current chunk without copying them. Use `consume(0)` to discard just the leftover.
+
 The adapter does not implement `BufRead`. To append through a delimiter into a
 reusable vector, use `read_until()` with any `BufRead` reader instead.
