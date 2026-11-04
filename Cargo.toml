@@ -1,17 +1,23 @@
 [package]
 name = "leftover"
-publish = false
-version = "0.1.0"
+version = "0.0.1"
+authors = ["Yun Peng <pengyun.me@outlook.com>"]
 edition = "2021"
 rust-version = "1.95"
 description = "A BufRead adapter for data spanning buffer boundaries"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/WangLabCSU/leftover"
+keywords = ["io", "buffer", "reader", "streaming", "parsing"]
+categories = ["parsing"]
+include = ["/src/**", "/benches/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [dependencies]
 memchr = "2.7"
 
 [dev-dependencies]
 bytes = "1.12"
-bytesreader = { git = "https://github.com/WangLabCSU/bytesreader", rev = "884d681a615aa0cc7d26fbe908b18968941c33f4" }
+bytesreader = "0.0.1"
 
 [[bench]]
 name = "reader"

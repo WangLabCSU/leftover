@@ -11,7 +11,8 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "bytesreader"
 version = "0.0.1"
-source = "git+https://github.com/WangLabCSU/bytesreader?rev=884d681a615aa0cc7d26fbe908b18968941c33f4#884d681a615aa0cc7d26fbe908b18968941c33f4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c4064ae3e4f602966b2b2bf8e18e79a38826fe6f34d41c82f9d375aad6e68ff"
 dependencies = [
  "bytes",
  "hotpath",
@@ -34,7 +35,7 @@ checksum = "5d92fdfec803932e5764ea93c201cf7c6c2d8cff1871da44f64f5094c9c3ef8a"
 
 [[package]]
 name = "leftover"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "bytesreader",
