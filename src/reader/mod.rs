@@ -1,8 +1,11 @@
 use std::io::{self, BufRead};
 
+mod deferred;
 mod view;
 
 pub use self::view::LeftoverView;
+
+use self::deferred::Deferred;
 
 /// A [`BufRead`] adapter for processing data across buffer boundaries.
 ///
@@ -78,23 +81,12 @@ pub use self::view::LeftoverView;
 /// assert_eq!(records[2], b"last");
 /// # Ok::<(), std::io::Error>(())
 /// ```
+#[derive(Debug)]
 pub struct LeftoverReader<R: ?Sized> {
     leftover: Vec<u8>,
-    // A view records how many bytes to consume from the last exposed chunk
-    // and whether to clear the prefix. Commit this before accessing inner mutably.
-    staged: Option<Action>,
+    // Commit a staged action before accessing inner mutably.
+    deferred: Deferred,
     inner: R,
-}
-
-enum LeftoverAction {
-    None,
-    Clear,
-}
-
-struct Action {
-    // Bounded by the chunk exposed to the view that recorded this action.
-    consume: usize,
-    leftover: LeftoverAction,
 }
 
 impl<R> LeftoverReader<R> {
@@ -102,27 +94,13 @@ impl<R> LeftoverReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             leftover: Vec::new(),
-            staged: None,
+            deferred: Deferred::default(),
             inner: reader,
         }
     }
 }
 
 impl<R: BufRead + ?Sized> LeftoverReader<R> {
-    #[inline]
-    fn commit(&mut self) {
-        // Commit each action once, before reading. Retrying a failed read must
-        // not consume the same bytes again or discard accumulated data.
-        if let Some(action) = self.staged.take() {
-            if let LeftoverAction::Clear = action.leftover {
-                self.leftover.clear();
-            }
-            if action.consume > 0 {
-                self.inner.consume(action.consume);
-            }
-        }
-    }
-
     /// Return a view of the leftover and current chunk, reading more input if
     /// needed.
     ///
@@ -163,9 +141,13 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     pub fn fill_view(&mut self) -> io::Result<LeftoverView<'_>> {
         // A new view must start with no staged action: its operations can
         // replace the slot without discarding a previous consumption.
-        self.commit();
+        self.deferred.commit(&mut self.leftover, &mut self.inner);
         let buf = self.inner.fill_buf()?;
-        Ok(LeftoverView::new(&mut self.leftover, buf, &mut self.staged))
+        Ok(LeftoverView::new(
+            &mut self.leftover,
+            buf,
+            &mut self.deferred,
+        ))
     }
 }
 
@@ -191,7 +173,7 @@ impl<R: ?Sized> LeftoverReader<R> {
     where
         R: BufRead,
     {
-        self.commit();
+        self.deferred.commit(&mut self.leftover, &mut self.inner);
         &mut self.inner
     }
 
@@ -204,7 +186,7 @@ impl<R: ?Sized> LeftoverReader<R> {
     where
         R: BufRead + Sized,
     {
-        self.commit();
+        self.deferred.commit(&mut self.leftover, &mut self.inner);
         self.inner
     }
 }

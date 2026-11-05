@@ -1,6 +1,6 @@
 use std::ops::{Bound, RangeBounds};
 
-use super::{Action, LeftoverAction};
+use super::deferred::{Action, Deferred, LeftoverAction};
 
 /// A view of the saved bytes and the current input chunk.
 ///
@@ -8,11 +8,12 @@ use super::{Action, LeftoverAction};
 /// The [`leftover`](Self::leftover) precedes the [`buffer`](Self::buffer) in
 /// the input; either can be empty.
 /// Its methods work with these bytes without reading from the source.
+#[derive(Debug)]
 pub struct LeftoverView<'a> {
     leftover: &'a mut Vec<u8>,
     buf: &'a [u8],
-    // None when the view is created; consuming the view can stage one action.
-    staged: &'a mut Option<Action>,
+    // Deferred::None when created; consuming the view can stage an action.
+    deferred: &'a mut Deferred,
 }
 
 impl<'a> LeftoverView<'a> {
@@ -20,12 +21,12 @@ impl<'a> LeftoverView<'a> {
     pub(super) fn new(
         leftover: &'a mut Vec<u8>,
         buf: &'a [u8],
-        staged: &'a mut Option<Action>,
+        deferred: &'a mut Deferred,
     ) -> Self {
         Self {
             leftover,
             buf,
-            staged,
+            deferred,
         }
     }
 
@@ -286,10 +287,8 @@ impl<'a> LeftoverView<'a> {
     #[inline]
     pub fn accumulate(self) {
         self.leftover.extend_from_slice(self.buf);
-        *self.staged = Some(Action {
-            consume: self.buf.len(),
-            leftover: LeftoverAction::None,
-        });
+        self.deferred
+            .stage(Action::new(self.buf.len(), LeftoverAction::None));
     }
 
     /// Discard the leftover and the first `end` bytes of the current chunk.
@@ -322,10 +321,7 @@ impl<'a> LeftoverView<'a> {
             "end exceeds the current chunk's length"
         );
         self.leftover.clear();
-        *self.staged = Some(Action {
-            consume: end,
-            leftover: LeftoverAction::None,
-        });
+        self.deferred.stage(Action::new(end, LeftoverAction::None));
     }
 
     /// Take the leftover and the first `end` bytes of the current chunk as one
@@ -354,17 +350,11 @@ impl<'a> LeftoverView<'a> {
     pub fn take_view(self, end: usize) -> &'a [u8] {
         let buf = &self.buf[..end];
         let view = if self.leftover.is_empty() {
-            *self.staged = Some(Action {
-                consume: end,
-                leftover: LeftoverAction::None,
-            });
+            self.deferred.stage(Action::new(end, LeftoverAction::None));
             buf
         } else {
             self.leftover.extend_from_slice(buf);
-            *self.staged = Some(Action {
-                consume: end,
-                leftover: LeftoverAction::Clear,
-            });
+            self.deferred.stage(Action::new(end, LeftoverAction::Clear));
             self.leftover.as_slice()
         };
         view
@@ -400,10 +390,7 @@ impl<'a> LeftoverView<'a> {
         };
         // The owned result does not borrow leftover; any prefix was cleared
         // above, so committing this action only needs to consume the chunk.
-        *self.staged = Some(Action {
-            consume: end,
-            leftover: LeftoverAction::None,
-        });
+        self.deferred.stage(Action::new(end, LeftoverAction::None));
         owned
     }
 
