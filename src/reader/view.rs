@@ -181,8 +181,11 @@ impl<'a> LeftoverView<'a> {
     pub fn get(&self, index: usize) -> u8 {
         let split = self.leftover.len();
         if index < split {
+            // SAFETY: This branch checks that the index is in the leftover.
             *unsafe { self.leftover.get_unchecked(index) }
         } else if index - split < self.buf.len() {
+            // SAFETY: The preceding branch rules out underflow, and this
+            // branch checks that the adjusted index is in the current chunk.
             *unsafe { self.buf.get_unchecked(index - split) }
         } else {
             Self::index_fail(index, split + self.buf.len())
@@ -617,7 +620,12 @@ mod tests {
         let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
         reader.fill_view().unwrap().accumulate();
         let view = reader.fill_view().unwrap();
-        for range in [4..3, 0..7, 7..7, 3..usize::MAX] {
+        for range in [
+            std::ops::Range { start: 4, end: 3 },
+            0..7,
+            7..7,
+            3..usize::MAX,
+        ] {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = view.slice(range);
             }));
@@ -698,10 +706,22 @@ mod tests {
             assert_eq!([leftover, buffer].concat(), b"bcde");
             compare(&view, input, CustomRange(1..7));
 
-            for range in [4..3, 7..3, 0..7, 7..7, 7..9, 3..usize::MAX] {
+            for range in [
+                Range { start: 4, end: 3 },
+                Range { start: 7, end: 3 },
+                0..7,
+                7..7,
+                7..9,
+                3..usize::MAX,
+            ] {
                 compare(&view, input, range);
             }
-            for range in [4..=2, 1..=6, 7..=9, 2..=usize::MAX] {
+            for range in [
+                std::ops::RangeInclusive::new(4, 2),
+                1..=6,
+                7..=9,
+                2..=usize::MAX,
+            ] {
                 compare(&view, input, range);
             }
             compare(&view, input, 7..);
@@ -717,6 +737,22 @@ mod tests {
                 (Excluded(2), Excluded(2)),
             ] {
                 compare(&view, input, range);
+            }
+            let mut bounds = vec![Unbounded];
+            for value in [0, 1, 2, 5, 6, 7, usize::MAX] {
+                bounds.extend([Included(value), Excluded(value)]);
+            }
+            for &start in &bounds {
+                for &end in &bounds {
+                    let range = (start, end);
+                    match catch_unwind(|| &input[range]) {
+                        Ok(expected) => {
+                            let (leftover, buffer) = view.slice(range);
+                            assert_eq!([leftover, buffer].concat(), expected, "range: {range:?}");
+                        }
+                        Err(_) => compare(&view, input, range),
+                    }
+                }
             }
             for index in [6, 9, usize::MAX] {
                 assert_eq!(

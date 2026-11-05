@@ -52,6 +52,8 @@ fn incomplete() -> io::Error {
 // partial records in BytesMut, search each byte once, and initialize the spare
 // tail before Read::read. split_to transfers the completed BytesMut instead of
 // borrowing or copying it.
+// MODE 1 intentionally measures allocating and copying each record.
+#[allow(clippy::unnecessary_to_owned)]
 fn bytes_mut<R: Read, const MODE: usize>(
     mut input: R,
     capacity: usize,
@@ -98,6 +100,8 @@ fn bytes_mut<R: Read, const MODE: usize>(
 }
 
 // Keep a scan offset because BytesReader retains the entire partial record.
+// MODE 1 intentionally measures allocating and copying each record.
+#[allow(clippy::unnecessary_to_owned)]
 fn bytes_reader<R: Read, const MODE: usize>(
     input: R,
     capacity: usize,
@@ -215,6 +219,7 @@ fn run<R: Read>(
 // incomplete records need scratch storage. MODE 1 copies the assembled record
 // and reuses scratch; MODE 2 transfers scratch with mem::take instead. MODE 3
 // copies to BytesMut, reusing scratch for spanning records.
+#[allow(clippy::unnecessary_to_owned)]
 fn standard<R: Read, const MODE: usize>(
     input: R,
     capacity: usize,
