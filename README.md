@@ -25,8 +25,13 @@ reader.fill_view().unwrap().accumulate();
 let view = reader.fill_view().unwrap();
 assert_eq!(view.leftover(), b"abc");
 assert_eq!(view.buffer(), b"def");
+assert_eq!(view.slice(1..5), (b"bc".as_slice(), b"de".as_slice()));
 assert_eq!(view.take_view(2), b"abcde");
 ```
+
+`slice()` selects a range across the leftover and current chunk, returning two
+borrowed slices without copying. It accepts ranges such as `..`, `2..`, `..4`,
+and `1..=4`. Use `get(index)` to retrieve one byte.
 
 `accumulate()` copies the current chunk. `take_view()` borrows directly when
 there is no leftover; otherwise it copies the selected bytes into the leftover.
