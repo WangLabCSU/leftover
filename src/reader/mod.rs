@@ -127,9 +127,10 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     /// needed.
     ///
     /// The leftover and current chunk are borrowed separately, without joining
-    /// or copying them. Bytes already taken or consumed are excluded. At EOF, the current
-    /// chunk is empty, but the leftover can still contain data. A reader with
-    /// a zero-capacity buffer can also return an empty chunk before EOF.
+    /// or copying them. Bytes already taken or consumed are excluded. At EOF,
+    /// the current chunk is empty, but the leftover can still contain data.
+    /// A reader with a zero-capacity buffer can also return an empty chunk
+    /// before EOF.
     ///
     /// Filling another view does not advance past the current chunk by itself.
     /// Call [`LeftoverView::accumulate`] to save the chunk before reading more.
@@ -181,8 +182,10 @@ impl<R: ?Sized> LeftoverReader<R> {
 
     /// Return a mutable reference to the wrapped reader.
     ///
-    /// Reading or seeking through this reference keeps the accumulated data,
-    /// which still comes before the next chunk returned by this adapter.
+    /// Bytes taken, consumed, or accumulated by the latest view are consumed
+    /// from the wrapped reader before the reference is returned. Accumulated
+    /// data is kept. Reading or seeking through this reference can change where
+    /// the next view obtains its current chunk.
     #[inline]
     pub fn get_mut(&mut self) -> &mut R
     where
