@@ -42,10 +42,5 @@ chunk only.
 Use `consume(end)` to discard the leftover and the first `end` bytes of the
 current chunk without copying them. Use `consume(0)` to discard just the leftover.
 
-Dropping the adapter finishes consuming bytes taken, consumed, or accumulated
-by its latest view and discards any leftover. If it wraps `&mut R`, that reader
-can then continue after those bytes. Dropping a view without performing an
-operation does not consume its current chunk.
-
 The adapter does not implement `BufRead`. To append through a delimiter into a
 reusable vector, use `read_until()` with any `BufRead` reader instead.

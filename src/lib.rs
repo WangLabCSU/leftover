@@ -18,10 +18,6 @@
 //! chunk `cdef`, an `end` of 2 takes `abcd`. At EOF, use `end = 0` to take any
 //! remaining leftover.
 //!
-//! Dropping the adapter finishes consuming bytes handled by its latest view
-//! and discards any leftover. If it wraps `&mut R`, that reader can then
-//! continue after the consumed bytes.
-//!
 //! ```
 //! use std::io::BufReader;
 //!
