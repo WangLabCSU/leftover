@@ -14,7 +14,9 @@ pub struct LeftoverView<'a> {
     leftover: &'a mut Vec<u8>,
     buf: &'a [u8],
     // The deferred slot is empty when this view is created. Staging consumes
-    // this permission, so an action cannot be staged through a borrow.
+    // this permission, so an action cannot be staged through a borrow. The
+    // reader commits it only after this view and its returned slices are no
+    // longer borrowed; until then, their backing bytes must remain available.
     staging: Staging<'a>,
 }
 

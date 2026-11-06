@@ -1,4 +1,6 @@
 use std::io::{self, BufRead};
+use std::mem::{self, ManuallyDrop};
+use std::ptr;
 
 mod action;
 mod staging;
@@ -22,7 +24,16 @@ use self::staging::Staging;
 /// [`LeftoverView::take_owned`] copies it into a vector. Use
 /// [`LeftoverView::consume`] to discard the data without returning it.
 ///
+/// Dropping the adapter finishes consuming bytes taken, consumed, or accumulated
+/// by the latest view, then discards any leftover. When wrapping `&mut R`, the
+/// wrapped reader can then continue after those bytes. Merely inspecting a view
+/// does not consume its current chunk.
+///
 /// This adapter does not implement `Read` or `BufRead`.
+///
+/// # Panics
+/// Dropping the adapter may call [`BufRead::consume`]. A panic from that method
+/// propagates; if it occurs while unwinding another panic, the process aborts.
 ///
 /// # Examples
 ///
@@ -45,6 +56,20 @@ use self::staging::Staging;
 /// assert_eq!(view.buffer(), b"def");
 /// assert_eq!(view.take_view(2), b"abcde");
 /// assert_eq!(reader.fill_view()?.buffer(), b"f");
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// Continue using a borrowed reader after the adapter leaves scope:
+///
+/// ```
+/// use leftover::LeftoverReader;
+///
+/// let mut input = b"abcd".as_slice();
+/// {
+///     let mut reader = LeftoverReader::new(&mut input);
+///     assert_eq!(reader.fill_view()?.take_view(2), b"ab");
+/// }
+/// assert_eq!(input, b"cd");
 /// # Ok::<(), std::io::Error>(())
 /// ```
 ///
@@ -84,13 +109,15 @@ use self::staging::Staging;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[derive(Debug)]
-pub struct LeftoverReader<R: ?Sized> {
+pub struct LeftoverReader<R: BufRead + ?Sized> {
     leftover: Vec<u8>,
+    // A borrowed result may still refer to inner or leftover. Commit only
+    // after its borrow has ended, before mutable access, extraction, or drop.
     deferred: Option<Action>,
     inner: R,
 }
 
-impl<R> LeftoverReader<R> {
+impl<R: BufRead> LeftoverReader<R> {
     /// Wrap a buffered reader without reading from it.
     pub fn new(reader: R) -> Self {
         Self {
@@ -102,18 +129,19 @@ impl<R> LeftoverReader<R> {
 }
 
 impl<R: BufRead + ?Sized> LeftoverReader<R> {
-    // Every entry point that needs mutable access shares this dispatcher.
+    // Mutable access, extraction, and Drop share this dispatcher.
     // Take the action before calling user-provided consume, so a panic cannot
-    // cause it to be replayed. Leave an empty slot untouched.
+    // cause it to be replayed by a later call or by Drop during unwinding.
+    // Leave an empty slot untouched.
     #[inline]
-    fn commit_deferred(deferred: &mut Option<Action>, leftover: &mut Vec<u8>, inner: &mut R) {
-        match deferred {
+    fn commit_deferred(&mut self) {
+        match self.deferred {
             None => {}
             Some(_) => {
-                let Some(action) = deferred.take() else {
+                let Some(action) = self.deferred.take() else {
                     unreachable!();
                 };
-                action.commit(leftover, inner);
+                action.commit(&mut self.leftover, &mut self.inner);
             }
         }
     }
@@ -156,25 +184,22 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     /// ```
     #[inline]
     pub fn fill_view(&mut self) -> io::Result<LeftoverView<'_>> {
-        let Self {
-            leftover,
-            deferred,
-            inner,
-        } = self;
-        Self::commit_deferred(deferred, leftover, inner);
+        self.commit_deferred();
         // On error the previous action is already committed, but no new
         // view or action exists. Retrying cannot replay the old action.
-        let buf = inner.fill_buf()?;
-        Ok(LeftoverView::new(leftover, buf, Staging::new(deferred)))
+        let buf = self.inner.fill_buf()?;
+        Ok(LeftoverView::new(
+            &mut self.leftover,
+            buf,
+            Staging::new(&mut self.deferred),
+        ))
     }
-}
 
-impl<R: ?Sized> LeftoverReader<R> {
     /// Return a reference to the wrapped reader.
     ///
     /// Bytes taken, consumed, or accumulated by the latest view may still appear in the
     /// wrapped reader until the next [`Self::fill_view`], [`Self::get_mut`],
-    /// or [`Self::into_inner`] call.
+    /// or [`Self::into_inner`] call, or until the adapter is dropped.
     #[inline]
     pub fn get_ref(&self) -> &R {
         &self.inner
@@ -187,18 +212,9 @@ impl<R: ?Sized> LeftoverReader<R> {
     /// data is kept. Reading or seeking through this reference can change where
     /// the next view obtains its current chunk.
     #[inline]
-    pub fn get_mut(&mut self) -> &mut R
-    where
-        R: BufRead,
-    {
-        // Reuse the field borrows so an unsized inner's address is computed once.
-        let Self {
-            leftover,
-            deferred,
-            inner,
-        } = self;
-        Self::commit_deferred(deferred, leftover, inner);
-        inner
+    pub fn get_mut(&mut self) -> &mut R {
+        self.commit_deferred();
+        &mut self.inner
     }
 
     /// Unwrap the reader, discarding any leftover.
@@ -208,10 +224,38 @@ impl<R: ?Sized> LeftoverReader<R> {
     #[inline]
     pub fn into_inner(mut self) -> R
     where
-        R: BufRead + Sized,
+        R: Sized,
     {
-        Self::commit_deferred(&mut self.deferred, &mut self.leftover, &mut self.inner);
-        self.inner
+        // Commit while self still has its normal destructor. If consume
+        // panics, Drop sees an empty slot and the fields are still destroyed.
+        self.commit_deferred();
+        self.into_parts().0
+    }
+
+    // Move out the reader and saved bytes after the pending action is committed.
+    // Keeping this private prevents callers from extracting an uncommitted reader.
+    #[inline]
+    fn into_parts(self) -> (R, Vec<u8>)
+    where
+        R: Sized,
+    {
+        debug_assert!(self.deferred.is_none(), "commit before extracting parts");
+        let mut this = ManuallyDrop::new(self);
+        let leftover = mem::take(&mut this.leftover);
+        // SAFETY: inner is initialized, and ManuallyDrop prevents self from
+        // dropping it. This moves it out exactly once, without using it again.
+        let inner = unsafe { ptr::read(&this.inner) };
+        (inner, leftover)
+    }
+}
+
+impl<R: BufRead + ?Sized> Drop for LeftoverReader<R> {
+    #[inline]
+    fn drop(&mut self) {
+        // Dropping self requires exclusive access, so neither a view nor a
+        // slice returned from it can still be used. Commit before the fields
+        // are dropped, including when self only borrows the wrapped reader.
+        self.commit_deferred();
     }
 }
 
@@ -223,6 +267,48 @@ mod tests {
 
     use super::LeftoverReader;
 
+    struct TrackedReader<'a> {
+        inner: BufReader<Cursor<Vec<u8>>>,
+        consumes: &'a Cell<usize>,
+        drops: &'a Cell<usize>,
+        panic_on_consume: bool,
+    }
+
+    impl<'a> TrackedReader<'a> {
+        fn new(consumes: &'a Cell<usize>, drops: &'a Cell<usize>) -> Self {
+            Self {
+                inner: BufReader::with_capacity(3, Cursor::new(b"abcdef".to_vec())),
+                consumes,
+                drops,
+                panic_on_consume: false,
+            }
+        }
+    }
+
+    impl Read for TrackedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl BufRead for TrackedReader<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.consumes.set(self.consumes.get() + 1);
+            assert!(!self.panic_on_consume, "consume failed");
+            self.inner.consume(amount);
+        }
+    }
+
+    impl Drop for TrackedReader<'_> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
     #[test]
     fn supports_slices_and_trait_objects() {
         let mut input = b"abcdef".as_slice();
@@ -233,6 +319,11 @@ mod tests {
         assert_eq!(reader.fill_view().unwrap().take_owned(2), b"cd");
         reader.fill_view().unwrap().accumulate();
         assert_eq!(reader.fill_view().unwrap().take_owned(0), b"ef");
+
+        let input: Box<dyn BufRead> = Box::new(b"abcdef".as_slice());
+        let mut reader = LeftoverReader::new(input);
+        assert_eq!(reader.fill_view().unwrap().take_view(2), b"ab");
+        assert_eq!(reader.get_mut().fill_buf().unwrap(), b"cdef");
 
         let mut reader = LeftoverReader::new(b"abcdef".as_slice());
         let erased: &mut LeftoverReader<dyn BufRead> = &mut reader;
@@ -439,36 +530,122 @@ mod tests {
     }
 
     #[test]
-    fn extraction_commits_only_once() {
-        struct Counted<'a> {
-            inner: BufReader<&'static [u8]>,
-            consumes: &'a Cell<usize>,
-        }
-        impl Read for Counted<'_> {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.inner.read(buf)
-            }
-        }
-        impl BufRead for Counted<'_> {
-            fn fill_buf(&mut self) -> io::Result<&[u8]> {
-                self.inner.fill_buf()
-            }
-            fn consume(&mut self, amount: usize) {
-                self.consumes.set(self.consumes.get() + 1);
-                self.inner.consume(amount);
-            }
-        }
+    fn extraction_commits_once_and_transfers_ownership() {
         let consumes = Cell::new(0);
-        let mut reader = LeftoverReader::new(Counted {
-            inner: BufReader::with_capacity(3, b"abcdef".as_slice()),
-            consumes: &consumes,
-        });
+        let drops = Cell::new(0);
+        let mut reader = LeftoverReader::new(TrackedReader::new(&consumes, &drops));
         reader.fill_view().unwrap().accumulate();
         assert_eq!(reader.fill_view().unwrap().take_view(1), b"abcd");
         assert_eq!(consumes.get(), 1);
         let mut inner = reader.into_inner();
         assert_eq!(consumes.get(), 2);
+        assert_eq!(drops.get(), 0);
         assert_eq!(inner.fill_buf().unwrap(), b"ef");
+        drop(inner);
         assert_eq!(consumes.get(), 2);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn drop_commits_each_view_operation() {
+        let data = b"abcdefghi";
+        for prefix in [false, true] {
+            for operation in 0..4 {
+                let mut input = BufReader::with_capacity(3, data.as_slice());
+                {
+                    let source: &mut dyn BufRead = &mut input;
+                    let mut reader = LeftoverReader::new(source);
+                    if prefix {
+                        reader.fill_view().unwrap().accumulate();
+                    }
+                    let view = reader.fill_view().unwrap();
+                    match operation {
+                        0 => view.accumulate(),
+                        1 => view.consume(2),
+                        2 => {
+                            view.take_view(2);
+                        }
+                        _ => {
+                            view.take_owned(2);
+                        }
+                    }
+                }
+                let mut rest = Vec::new();
+                input.read_to_end(&mut rest).unwrap();
+                let end = if prefix { 3 } else { 0 } + if operation == 0 { 3 } else { 2 };
+                assert_eq!(rest, &data[end..], "prefix={prefix}, operation={operation}");
+            }
+        }
+    }
+
+    #[test]
+    fn drop_without_a_pending_action_does_not_consume_again() {
+        for state in 0..3 {
+            let consumes = Cell::new(0);
+            let drops = Cell::new(0);
+            {
+                let mut reader = LeftoverReader::new(TrackedReader::new(&consumes, &drops));
+                match state {
+                    0 => {} // No view was created.
+                    1 => {
+                        assert_eq!(reader.fill_view().unwrap().buffer(), b"abc");
+                    }
+                    _ => {
+                        reader.fill_view().unwrap().consume(1);
+                        assert_eq!(reader.get_mut().fill_buf().unwrap(), b"bc");
+                    }
+                }
+            }
+            assert_eq!(consumes.get(), usize::from(state == 2));
+            assert_eq!(drops.get(), 1);
+        }
+    }
+
+    #[test]
+    fn drop_commits_during_unwinding() {
+        let consumes = Cell::new(0);
+        let drops = Cell::new(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut reader = LeftoverReader::new(TrackedReader::new(&consumes, &drops));
+            assert_eq!(reader.fill_view().unwrap().take_view(1), b"a");
+            panic!("parser failed");
+        }));
+        assert!(result.is_err());
+        assert_eq!(consumes.get(), 1);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn drop_and_extraction_clean_up_if_consume_panics() {
+        for extract in [false, true] {
+            let consumes = Cell::new(0);
+            let drops = Cell::new(0);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut source = TrackedReader::new(&consumes, &drops);
+                source.panic_on_consume = true;
+                let mut reader = LeftoverReader::new(source);
+                reader.fill_view().unwrap().accumulate();
+                if extract {
+                    drop(reader.into_inner());
+                } else {
+                    drop(reader);
+                }
+            }));
+            assert!(result.is_err());
+            assert_eq!(consumes.get(), 1);
+            assert_eq!(drops.get(), 1);
+        }
+    }
+
+    #[test]
+    fn drop_supports_an_unsized_inner() {
+        let consumes = Cell::new(0);
+        let drops = Cell::new(0);
+        let mut reader: Box<LeftoverReader<dyn BufRead + '_>> =
+            Box::new(LeftoverReader::new(TrackedReader::new(&consumes, &drops)));
+        assert_eq!(reader.fill_view().unwrap().take_view(2), b"ab");
+        drop(reader);
+        assert_eq!(consumes.get(), 1);
+        assert_eq!(drops.get(), 1);
     }
 }
