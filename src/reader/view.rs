@@ -1,6 +1,6 @@
 use std::ops::{Bound, RangeBounds};
 
-use super::deferred::{Action, Deferred, LeftoverAction};
+use super::deferred::{Action, LeftoverAction, Staging};
 
 /// A view of the saved bytes and the current input chunk.
 ///
@@ -12,21 +12,18 @@ use super::deferred::{Action, Deferred, LeftoverAction};
 pub struct LeftoverView<'a> {
     leftover: &'a mut Vec<u8>,
     buf: &'a [u8],
-    // Deferred::None when created; consuming the view can stage an action.
-    deferred: &'a mut Deferred,
+    // The deferred slot is empty when this view is created. Staging consumes
+    // this permission, so an action cannot be staged through a borrow.
+    staging: Staging<'a>,
 }
 
 impl<'a> LeftoverView<'a> {
     #[inline]
-    pub(super) fn new(
-        leftover: &'a mut Vec<u8>,
-        buf: &'a [u8],
-        deferred: &'a mut Deferred,
-    ) -> Self {
+    pub(super) fn new(leftover: &'a mut Vec<u8>, buf: &'a [u8], staging: Staging<'a>) -> Self {
         Self {
             leftover,
             buf,
-            deferred,
+            staging,
         }
     }
 
@@ -302,7 +299,7 @@ impl<'a> LeftoverView<'a> {
     #[inline]
     pub fn accumulate(self) {
         self.leftover.extend_from_slice(self.buf);
-        self.deferred
+        self.staging
             .stage(Action::new(self.buf.len(), LeftoverAction::None));
     }
 
@@ -336,7 +333,7 @@ impl<'a> LeftoverView<'a> {
             "end exceeds the current chunk's length"
         );
         self.leftover.clear();
-        self.deferred.stage(Action::new(end, LeftoverAction::None));
+        self.staging.stage(Action::new(end, LeftoverAction::None));
     }
 
     /// Take the leftover and the first `end` bytes of the current chunk as one
@@ -365,11 +362,11 @@ impl<'a> LeftoverView<'a> {
     pub fn take_view(self, end: usize) -> &'a [u8] {
         let buf = &self.buf[..end];
         let view = if self.leftover.is_empty() {
-            self.deferred.stage(Action::new(end, LeftoverAction::None));
+            self.staging.stage(Action::new(end, LeftoverAction::None));
             buf
         } else {
             self.leftover.extend_from_slice(buf);
-            self.deferred.stage(Action::new(end, LeftoverAction::Clear));
+            self.staging.stage(Action::new(end, LeftoverAction::Clear));
             self.leftover.as_slice()
         };
         view
@@ -405,7 +402,7 @@ impl<'a> LeftoverView<'a> {
         };
         // The owned result does not borrow leftover; any prefix was cleared
         // above, so committing this action only needs to consume the chunk.
-        self.deferred.stage(Action::new(end, LeftoverAction::None));
+        self.staging.stage(Action::new(end, LeftoverAction::None));
         owned
     }
 

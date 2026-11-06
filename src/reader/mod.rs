@@ -139,15 +139,10 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     /// ```
     #[inline]
     pub fn fill_view(&mut self) -> io::Result<LeftoverView<'_>> {
-        // A new view must start with no staged action: its operations can
-        // replace the slot without discarding a previous consumption.
-        self.deferred.commit(&mut self.leftover, &mut self.inner);
+        // The permission is issued only after the previous action is committed.
+        let staging = self.deferred.commit(&mut self.leftover, &mut self.inner);
         let buf = self.inner.fill_buf()?;
-        Ok(LeftoverView::new(
-            &mut self.leftover,
-            buf,
-            &mut self.deferred,
-        ))
+        Ok(LeftoverView::new(&mut self.leftover, buf, staging))
     }
 }
 
