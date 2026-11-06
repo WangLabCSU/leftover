@@ -130,6 +130,31 @@ impl<R: BufRead> LeftoverReader<R> {
             inner: reader,
         }
     }
+
+    /// Unwrap the reader, discarding any leftover.
+    ///
+    /// The returned reader continues after bytes already taken, consumed, or accumulated.
+    /// Bytes saved in the leftover are not put back into the returned reader.
+    #[inline]
+    pub fn into_inner(mut self) -> R {
+        // Commit while self still has its normal destructor. If consume
+        // panics, Drop sees an empty slot and the fields are still destroyed.
+        self.commit_deferred();
+        self.into_parts().0
+    }
+
+    // Move out the reader and saved bytes after the pending action is committed.
+    // Keeping this private prevents callers from extracting an uncommitted reader.
+    #[inline]
+    fn into_parts(self) -> (R, Vec<u8>) {
+        debug_assert!(self.deferred.is_none(), "commit before extracting parts");
+        let mut this = ManuallyDrop::new(self);
+        let leftover = mem::take(&mut this.leftover);
+        // SAFETY: inner is initialized, and ManuallyDrop prevents self from
+        // dropping it. This moves it out exactly once, without using it again.
+        let inner = unsafe { ptr::read(&this.inner) };
+        (inner, leftover)
+    }
 }
 
 impl<R: BufRead + ?Sized> LeftoverReader<R> {
@@ -202,8 +227,7 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     /// Return a reference to the wrapped reader.
     ///
     /// Bytes taken, consumed, or accumulated by the latest view may still appear in the
-    /// wrapped reader until the next [`Self::fill_view`], [`Self::get_mut`],
-    /// or [`Self::into_inner`] call, or until the adapter is dropped.
+    /// wrapped reader.
     #[inline]
     pub fn get_ref(&self) -> &R {
         &self.inner
@@ -219,37 +243,6 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     pub fn get_mut(&mut self) -> &mut R {
         self.commit_deferred();
         &mut self.inner
-    }
-
-    /// Unwrap the reader, discarding any leftover.
-    ///
-    /// The returned reader continues after bytes already taken, consumed, or accumulated.
-    /// Bytes saved in the leftover are not put back into the returned reader.
-    #[inline]
-    pub fn into_inner(mut self) -> R
-    where
-        R: Sized,
-    {
-        // Commit while self still has its normal destructor. If consume
-        // panics, Drop sees an empty slot and the fields are still destroyed.
-        self.commit_deferred();
-        self.into_parts().0
-    }
-
-    // Move out the reader and saved bytes after the pending action is committed.
-    // Keeping this private prevents callers from extracting an uncommitted reader.
-    #[inline]
-    fn into_parts(self) -> (R, Vec<u8>)
-    where
-        R: Sized,
-    {
-        debug_assert!(self.deferred.is_none(), "commit before extracting parts");
-        let mut this = ManuallyDrop::new(self);
-        let leftover = mem::take(&mut this.leftover);
-        // SAFETY: inner is initialized, and ManuallyDrop prevents self from
-        // dropping it. This moves it out exactly once, without using it again.
-        let inner = unsafe { ptr::read(&this.inner) };
-        (inner, leftover)
     }
 }
 
