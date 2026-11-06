@@ -15,11 +15,16 @@ impl Deferred {
 
     #[inline]
     pub(super) fn commit<R: BufRead + ?Sized>(&mut self, leftover: &mut Vec<u8>, reader: &mut R) {
-        // Clear the state before committing so a panic cannot cause
-        // this action to be committed again.
-        match std::mem::take(self) {
+        match self {
             Self::None => {}
-            Self::Staged(action) => action.commit(leftover, reader),
+            Self::Staged(_) => {
+                // Clear the state before committing so a panic cannot cause
+                // this action to be committed again.
+                let Self::Staged(action) = std::mem::replace(self, Self::None) else {
+                    unreachable!();
+                };
+                action.commit(leftover, reader);
+            }
         }
     }
 }
