@@ -74,8 +74,10 @@ impl<'a> LeftoverView<'a> {
     pub fn slice(&self, range: impl RangeBounds<usize>) -> (&[u8], &[u8]) {
         let split = self.leftover.len();
         let len = split + self.buf.len();
-        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
-        let end = match bounds.1 {
+        let start_bound = range.start_bound().cloned();
+        let end_bound = range.end_bound().cloned();
+
+        let end = match end_bound {
             Bound::Included(end) if end >= len => Self::slice_index_fail(0, end, len),
             // end < len, so adding one cannot overflow.
             Bound::Included(end) => end + 1,
@@ -83,7 +85,7 @@ impl<'a> LeftoverView<'a> {
             Bound::Excluded(end) => end,
             Bound::Unbounded => len,
         };
-        let start = match bounds.0 {
+        let start = match start_bound {
             Bound::Excluded(start) if start >= end => Self::slice_index_fail(start, end, len),
             // start < end, so adding one cannot overflow.
             Bound::Excluded(start) => start + 1,
@@ -92,11 +94,23 @@ impl<'a> LeftoverView<'a> {
             Bound::Unbounded => 0,
         };
         if start >= split {
-            (&[], &self.buf[start - split..end - split])
+            // SAFETY: The checks above establish start <= end <= len. Both
+            // bounds are at or after split, so the adjusted range is in buf.
+            (&[], unsafe {
+                self.buf.get_unchecked(start - split..end - split)
+            })
         } else if end > split {
-            (&self.leftover[start..], &self.buf[..end - split])
+            // SAFETY: start < split < end <= len, so each range is within
+            // its respective slice.
+            unsafe {
+                (
+                    self.leftover.get_unchecked(start..),
+                    self.buf.get_unchecked(..end - split),
+                )
+            }
         } else {
-            (&self.leftover[start..end], &[])
+            // SAFETY: start <= end <= split, so the range is in leftover.
+            (unsafe { self.leftover.get_unchecked(start..end) }, &[])
         }
     }
 
@@ -121,6 +135,7 @@ impl<'a> LeftoverView<'a> {
     /// # Ok::<(), std::io::Error>(())
     /// ```
     #[inline]
+    #[track_caller]
     pub unsafe fn slice_unchecked(&self, range: impl RangeBounds<usize>) -> (&[u8], &[u8]) {
         let split = self.leftover.len();
         let start_bound = range.start_bound();
@@ -193,30 +208,6 @@ impl<'a> LeftoverView<'a> {
         }
     }
 
-    #[cold]
-    #[inline(never)]
-    #[track_caller]
-    fn index_fail(index: usize, len: usize) -> ! {
-        panic!("index out of bounds: the len is {len} but the index is {index}")
-    }
-
-    #[cold]
-    #[inline(never)]
-    #[track_caller]
-    fn slice_index_fail(start: usize, end: usize, len: usize) -> ! {
-        if start > len {
-            panic!("range start index {start} out of range for slice of length {len}");
-        }
-        if end > len {
-            panic!("range end index {end} out of range for slice of length {len}");
-        }
-        if start > end {
-            panic!("slice index starts at {start} but ends at {end}");
-        }
-        // An inclusive end at len or an excluded start at end is invalid.
-        panic!("range end index {end} out of range for slice of length {len}")
-    }
-
     /// Return the byte at `index` without checking whether it is in bounds.
     ///
     /// `index` counts from the start of the leftover.
@@ -259,6 +250,30 @@ impl<'a> LeftoverView<'a> {
             // together, and this branch places it in the current chunk.
             unsafe { *self.buf.get_unchecked(index - split) }
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[track_caller]
+    fn index_fail(index: usize, len: usize) -> ! {
+        panic!("index out of bounds: the len is {len} but the index is {index}")
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[track_caller]
+    fn slice_index_fail(start: usize, end: usize, len: usize) -> ! {
+        if start > len {
+            panic!("range start index {start} out of range for slice of length {len}");
+        }
+        if end > len {
+            panic!("range end index {end} out of range for slice of length {len}");
+        }
+        if start > end {
+            panic!("slice index starts at {start} but ends at {end}");
+        }
+        // An inclusive end at len or an excluded start at end is invalid.
+        panic!("range end index {end} out of range for slice of length {len}")
     }
 
     /// Add the current chunk to the leftover.
@@ -603,6 +618,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_view_accepts_empty_ranges() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        let mut reader = LeftoverReader::new(b"".as_slice());
+        let view = reader.fill_view().unwrap();
+        for range in [
+            (Unbounded, Unbounded),
+            (Unbounded, Excluded(0)),
+            (Included(0), Unbounded),
+            (Included(0), Excluded(0)),
+        ] {
+            assert_eq!(view.slice(range), (b"".as_slice(), b"".as_slice()));
+            // SAFETY: Each range selects zero bytes at the start of the view.
+            assert_eq!(unsafe { view.slice_unchecked(range) }, view.slice(range));
+        }
+        for range in [
+            (Included(0), Included(0)),
+            (Excluded(0), Unbounded),
+            (Included(1), Excluded(1)),
+        ] {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                view.slice(range)
+            }))
+            .is_err());
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| view.get(0))).is_err());
+    }
+
+    #[test]
     fn slice_rejects_invalid_ranges_without_consuming_data() {
         let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
         reader.fill_view().unwrap().accumulate();
@@ -736,6 +780,13 @@ mod tests {
                         Ok(expected) => {
                             let (leftover, buffer) = view.slice(range);
                             assert_eq!([leftover, buffer].concat(), expected, "range: {range:?}");
+                            // SAFETY: Standard slice indexing accepted these
+                            // bounds for the same combined length.
+                            assert_eq!(
+                                unsafe { view.slice_unchecked(range) },
+                                (leftover, buffer),
+                                "range: {range:?}"
+                            );
                         }
                         Err(_) => compare(&view, input, range),
                     }
