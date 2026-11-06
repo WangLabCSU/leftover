@@ -1,11 +1,13 @@
 use std::io::{self, BufRead};
 
-mod deferred;
+mod action;
+mod staging;
 mod view;
 
 pub use self::view::LeftoverView;
 
-use self::deferred::Deferred;
+use self::action::Action;
+use self::staging::Staging;
 
 /// A [`BufRead`] adapter for processing data across buffer boundaries.
 ///
@@ -84,8 +86,7 @@ use self::deferred::Deferred;
 #[derive(Debug)]
 pub struct LeftoverReader<R: ?Sized> {
     leftover: Vec<u8>,
-    // Commit a staged action before accessing inner mutably.
-    deferred: Deferred,
+    deferred: Option<Action>,
     inner: R,
 }
 
@@ -94,13 +95,29 @@ impl<R> LeftoverReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
             leftover: Vec::new(),
-            deferred: Deferred::default(),
+            deferred: None,
             inner: reader,
         }
     }
 }
 
 impl<R: BufRead + ?Sized> LeftoverReader<R> {
+    // Every entry point that needs mutable access shares this dispatcher.
+    // Take the action before calling user-provided consume, so a panic cannot
+    // cause it to be replayed. Leave an empty slot untouched.
+    #[inline]
+    fn commit_deferred(deferred: &mut Option<Action>, leftover: &mut Vec<u8>, inner: &mut R) {
+        match deferred {
+            None => {}
+            Some(_) => {
+                let Some(action) = deferred.take() else {
+                    unreachable!();
+                };
+                action.commit(leftover, inner);
+            }
+        }
+    }
+
     /// Return a view of the leftover and current chunk, reading more input if
     /// needed.
     ///
@@ -139,10 +156,16 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     /// ```
     #[inline]
     pub fn fill_view(&mut self) -> io::Result<LeftoverView<'_>> {
-        // The permission is issued only after the previous action is committed.
-        let staging = self.deferred.commit(&mut self.leftover, &mut self.inner);
-        let buf = self.inner.fill_buf()?;
-        Ok(LeftoverView::new(&mut self.leftover, buf, staging))
+        let Self {
+            leftover,
+            deferred,
+            inner,
+        } = self;
+        Self::commit_deferred(deferred, leftover, inner);
+        // On error the previous action is already committed, but no new
+        // view or action exists. Retrying cannot replay the old action.
+        let buf = inner.fill_buf()?;
+        Ok(LeftoverView::new(leftover, buf, Staging::new(deferred)))
     }
 }
 
@@ -168,8 +191,14 @@ impl<R: ?Sized> LeftoverReader<R> {
     where
         R: BufRead,
     {
-        self.deferred.commit(&mut self.leftover, &mut self.inner);
-        &mut self.inner
+        // Reuse the field borrows so an unsized inner's address is computed once.
+        let Self {
+            leftover,
+            deferred,
+            inner,
+        } = self;
+        Self::commit_deferred(deferred, leftover, inner);
+        inner
     }
 
     /// Unwrap the reader, discarding any leftover.
@@ -181,14 +210,16 @@ impl<R: ?Sized> LeftoverReader<R> {
     where
         R: BufRead + Sized,
     {
-        self.deferred.commit(&mut self.leftover, &mut self.inner);
+        Self::commit_deferred(&mut self.deferred, &mut self.leftover, &mut self.inner);
         self.inner
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io::{self, BufRead, BufReader, Cursor, Read};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use super::LeftoverReader;
 
@@ -202,6 +233,11 @@ mod tests {
         assert_eq!(reader.fill_view().unwrap().take_owned(2), b"cd");
         reader.fill_view().unwrap().accumulate();
         assert_eq!(reader.fill_view().unwrap().take_owned(0), b"ef");
+
+        let mut reader = LeftoverReader::new(b"abcdef".as_slice());
+        let erased: &mut LeftoverReader<dyn BufRead> = &mut reader;
+        assert_eq!(erased.fill_view().unwrap().take_view(2), b"ab");
+        assert_eq!(erased.get_mut().fill_buf().unwrap(), b"cdef");
     }
 
     #[test]
@@ -282,13 +318,21 @@ mod tests {
 
     #[test]
     fn failed_refills_do_not_duplicate_the_prefix() {
-        struct Fails;
-        impl Read for Fails {
+        struct FailsTwice(usize);
+        impl Read for FailsTwice {
             fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-                Err(io::ErrorKind::Interrupted.into())
+                if self.0 < 2 {
+                    self.0 += 1;
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(0)
+                }
             }
         }
-        let source = b"abc".as_slice().chain(Fails);
+        let source = b"abc"
+            .as_slice()
+            .chain(FailsTwice(0))
+            .chain(b"def".as_slice());
         let mut reader = LeftoverReader::new(BufReader::with_capacity(3, source));
         assert_eq!(reader.fill_view().unwrap().take_view(1), b"a");
         reader.fill_view().unwrap().accumulate();
@@ -297,8 +341,11 @@ mod tests {
                 reader.fill_view().err().unwrap().kind(),
                 io::ErrorKind::Interrupted
             );
-            assert_eq!(reader.leftover, b"bc");
         }
+        let view = reader.fill_view().unwrap();
+        assert_eq!(view.leftover(), b"bc");
+        assert_eq!(view.buffer(), b"def");
+        assert_eq!(view.take_view(2), b"bcde");
     }
 
     #[test]
@@ -309,5 +356,119 @@ mod tests {
         let mut zero = LeftoverReader::new(BufReader::with_capacity(0, b"x".as_slice()));
         assert!(zero.fill_view().unwrap().buffer().is_empty());
         assert_eq!(*zero.into_inner().get_ref(), b"x");
+    }
+
+    #[test]
+    fn view_operations_commit_each_action_once() {
+        let mut reader = LeftoverReader::new(b"abcd".as_slice());
+        assert_eq!(reader.fill_view().unwrap().take_view(2), b"ab");
+        assert_eq!(*reader.get_mut(), b"cd");
+        assert_eq!(*reader.get_mut(), b"cd");
+        assert_eq!(reader.fill_view().unwrap().take_view(1), b"c");
+        assert_eq!(reader.into_inner(), b"d");
+    }
+
+    #[test]
+    fn commit_clears_the_slot_before_consume_panics() {
+        struct PanicOnConsume {
+            consumes: usize,
+        }
+        impl Read for PanicOnConsume {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl BufRead for PanicOnConsume {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Ok(b"x")
+            }
+            fn consume(&mut self, _: usize) {
+                self.consumes += 1;
+                panic!("consume failed");
+            }
+        }
+        let mut reader = LeftoverReader::new(PanicOnConsume { consumes: 0 });
+        reader.leftover.extend_from_slice(b"prefix");
+        assert_eq!(reader.fill_view().unwrap().take_view(1), b"prefixx");
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            reader.get_mut();
+        }))
+        .is_err());
+        assert!(reader.leftover.is_empty());
+        assert!(reader.deferred.is_none());
+        assert_eq!(reader.get_mut().consumes, 1);
+        assert_eq!(reader.into_inner().consumes, 1);
+    }
+
+    #[test]
+    fn mutable_access_commits_without_discarding_accumulated_bytes() {
+        let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
+        reader.fill_view().unwrap().accumulate();
+        let pointer = reader.leftover.as_ptr();
+        assert_eq!(reader.get_mut().fill_buf().unwrap(), b"def");
+        assert_eq!(reader.leftover, b"abc");
+        assert_eq!(reader.leftover.as_ptr(), pointer);
+        let view = reader.fill_view().unwrap();
+        assert_eq!(view.leftover(), b"abc");
+        assert_eq!(view.leftover().as_ptr(), pointer);
+        assert_eq!(view.take_view(1), b"abcd");
+        let mut inner = reader.into_inner();
+        assert_eq!(inner.fill_buf().unwrap(), b"ef");
+    }
+
+    #[test]
+    fn dropping_a_view_keeps_both_parts_available() {
+        let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
+        reader.fill_view().unwrap().accumulate();
+        let view = reader.fill_view().unwrap();
+        assert_eq!(view.leftover(), b"abc");
+        assert_eq!(view.buffer(), b"def");
+        // Reading a view without completing an operation stages nothing.
+        let view = reader.fill_view().unwrap();
+        assert_eq!(view.leftover(), b"abc");
+        assert_eq!(view.buffer(), b"def");
+        assert_eq!(view.take_view(1), b"abcd");
+    }
+
+    #[test]
+    fn extraction_commits_accumulation() {
+        let mut reader = LeftoverReader::new(BufReader::with_capacity(3, b"abcdef".as_slice()));
+        reader.fill_view().unwrap().accumulate();
+        let mut inner = reader.into_inner();
+        assert_eq!(inner.fill_buf().unwrap(), b"def");
+    }
+
+    #[test]
+    fn extraction_commits_only_once() {
+        struct Counted<'a> {
+            inner: BufReader<&'static [u8]>,
+            consumes: &'a Cell<usize>,
+        }
+        impl Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+        impl BufRead for Counted<'_> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.inner.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.consumes.set(self.consumes.get() + 1);
+                self.inner.consume(amount);
+            }
+        }
+        let consumes = Cell::new(0);
+        let mut reader = LeftoverReader::new(Counted {
+            inner: BufReader::with_capacity(3, b"abcdef".as_slice()),
+            consumes: &consumes,
+        });
+        reader.fill_view().unwrap().accumulate();
+        assert_eq!(reader.fill_view().unwrap().take_view(1), b"abcd");
+        assert_eq!(consumes.get(), 1);
+        let mut inner = reader.into_inner();
+        assert_eq!(consumes.get(), 2);
+        assert_eq!(inner.fill_buf().unwrap(), b"ef");
+        assert_eq!(consumes.get(), 2);
     }
 }

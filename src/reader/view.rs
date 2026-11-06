@@ -1,6 +1,7 @@
 use std::ops::{Bound, RangeBounds};
 
-use super::deferred::{Action, LeftoverAction, Staging};
+use super::action::{Action, LeftoverAction};
+use super::staging::Staging;
 
 /// A view of the saved bytes and the current input chunk.
 ///
