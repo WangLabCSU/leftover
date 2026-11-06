@@ -109,14 +109,11 @@ use self::staging::Staging;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[derive(Debug)]
-pub struct LeftoverReader<R: ?Sized> {
+pub struct LeftoverReader<R: BufRead + ?Sized> {
     leftover: Vec<u8>,
     // A borrowed result may still refer to inner or leftover. Commit only
     // after its borrow has ended, before mutable access, extraction, or drop.
     deferred: Option<Action>,
-    // Set by new while R: BufRead is known. Drop can invoke this function
-    // without requiring that bound on the struct; other callers commit directly.
-    drop_callback: fn(&mut Self),
     inner: R,
 }
 
@@ -126,7 +123,6 @@ impl<R: BufRead> LeftoverReader<R> {
         Self {
             leftover: Vec::new(),
             deferred: None,
-            drop_callback: Self::commit_deferred,
             inner: reader,
         }
     }
@@ -161,17 +157,10 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     // Mutable access, extraction, and Drop share this dispatcher.
     // Take the action before calling user-provided consume, so a panic cannot
     // cause it to be replayed by a later call or by Drop during unwinding.
-    // Leave an empty slot untouched.
     #[inline]
     fn commit_deferred(&mut self) {
-        match self.deferred {
-            None => {}
-            Some(_) => {
-                let Some(action) = self.deferred.take() else {
-                    unreachable!();
-                };
-                action.commit(&mut self.leftover, &mut self.inner);
-            }
+        if let Some(action) = self.deferred.take() {
+            action.commit(&mut self.leftover, &mut self.inner);
         }
     }
 
@@ -246,13 +235,13 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     }
 }
 
-impl<R: ?Sized> Drop for LeftoverReader<R> {
+impl<R: BufRead + ?Sized> Drop for LeftoverReader<R> {
     #[inline]
     fn drop(&mut self) {
         // Dropping self requires exclusive access, so neither a view nor a
         // slice returned from it can still be used. Commit before the fields
         // are dropped, including when self only borrows the wrapped reader.
-        (self.drop_callback)(self);
+        self.commit_deferred();
     }
 }
 
@@ -642,10 +631,8 @@ mod tests {
     }
 
     #[test]
-    fn drop_does_not_require_a_bufread_bound() {
-        // Generic owners can drop the adapter without repeating its constructor's
-        // BufRead bound. The registered callback still commits the pending action.
-        fn drop_reader<R>(reader: LeftoverReader<R>) {
+    fn drop_commits_in_a_generic_owner() {
+        fn drop_reader<R: BufRead>(reader: LeftoverReader<R>) {
             drop(reader);
         }
 
