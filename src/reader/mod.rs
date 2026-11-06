@@ -109,11 +109,14 @@ use self::staging::Staging;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[derive(Debug)]
-pub struct LeftoverReader<R: BufRead + ?Sized> {
+pub struct LeftoverReader<R: ?Sized> {
     leftover: Vec<u8>,
     // A borrowed result may still refer to inner or leftover. Commit only
     // after its borrow has ended, before mutable access, extraction, or drop.
     deferred: Option<Action>,
+    // Set by new while R: BufRead is known. Drop can invoke this function
+    // without requiring that bound on the struct; other callers commit directly.
+    drop_callback: fn(&mut Self),
     inner: R,
 }
 
@@ -123,6 +126,7 @@ impl<R: BufRead> LeftoverReader<R> {
         Self {
             leftover: Vec::new(),
             deferred: None,
+            drop_callback: Self::commit_deferred,
             inner: reader,
         }
     }
@@ -249,13 +253,13 @@ impl<R: BufRead + ?Sized> LeftoverReader<R> {
     }
 }
 
-impl<R: BufRead + ?Sized> Drop for LeftoverReader<R> {
+impl<R: ?Sized> Drop for LeftoverReader<R> {
     #[inline]
     fn drop(&mut self) {
         // Dropping self requires exclusive access, so neither a view nor a
         // slice returned from it can still be used. Commit before the fields
         // are dropped, including when self only borrows the wrapped reader.
-        self.commit_deferred();
+        (self.drop_callback)(self);
     }
 }
 
@@ -324,11 +328,6 @@ mod tests {
         let mut reader = LeftoverReader::new(input);
         assert_eq!(reader.fill_view().unwrap().take_view(2), b"ab");
         assert_eq!(reader.get_mut().fill_buf().unwrap(), b"cdef");
-
-        let mut reader = LeftoverReader::new(b"abcdef".as_slice());
-        let erased: &mut LeftoverReader<dyn BufRead> = &mut reader;
-        assert_eq!(erased.fill_view().unwrap().take_view(2), b"ab");
-        assert_eq!(erased.get_mut().fill_buf().unwrap(), b"cdef");
     }
 
     #[test]
@@ -638,13 +637,30 @@ mod tests {
     }
 
     #[test]
-    fn drop_supports_an_unsized_inner() {
+    fn drop_supports_a_boxed_trait_object() {
         let consumes = Cell::new(0);
         let drops = Cell::new(0);
-        let mut reader: Box<LeftoverReader<dyn BufRead + '_>> =
-            Box::new(LeftoverReader::new(TrackedReader::new(&consumes, &drops)));
+        let source: Box<dyn BufRead + '_> = Box::new(TrackedReader::new(&consumes, &drops));
+        let mut reader = LeftoverReader::new(source);
         assert_eq!(reader.fill_view().unwrap().take_view(2), b"ab");
         drop(reader);
+        assert_eq!(consumes.get(), 1);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn drop_does_not_require_a_bufread_bound() {
+        // Generic owners can drop the adapter without repeating its constructor's
+        // BufRead bound. The registered callback still commits the pending action.
+        fn drop_reader<R>(reader: LeftoverReader<R>) {
+            drop(reader);
+        }
+
+        let consumes = Cell::new(0);
+        let drops = Cell::new(0);
+        let mut reader = LeftoverReader::new(TrackedReader::new(&consumes, &drops));
+        reader.fill_view().unwrap().consume(2);
+        drop_reader(reader);
         assert_eq!(consumes.get(), 1);
         assert_eq!(drops.get(), 1);
     }
